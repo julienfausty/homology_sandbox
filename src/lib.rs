@@ -3,10 +3,12 @@
 use itertools::Itertools;
 use ndarray::{Array1, Array2, ArrayView2};
 
+use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::iter::zip;
 
+/// Utility structure mostly for evaluating equality of simplices
 #[derive(PartialEq, Eq, Debug)]
 struct Simplex {
     pub vertices: HashSet<usize>,
@@ -224,11 +226,146 @@ impl ChainComplex {
     }
 }
 
+fn reduced_row_echelon_form(matrix: &Array2<i32>) -> (Array2<f64>, Array2<f64>) {
+    let mut buffer_matrix = Array2::from_shape_vec(
+        [matrix.shape()[0], matrix.shape()[1]],
+        matrix.iter().map(|val| *val as f64).collect::<Vec<f64>>(),
+    )
+    .unwrap();
+    let mut change_of_basis = Array2::eye(matrix.shape()[0]);
+
+    let number_of_rows = buffer_matrix.shape()[0];
+    let number_of_pivots = min(number_of_rows, buffer_matrix.shape()[1]);
+
+    if number_of_pivots == 0 {
+        return (buffer_matrix, change_of_basis);
+    }
+
+    let mut row_offset = 0;
+
+    for i_row in 0..number_of_pivots {
+        let i_pivot = i_row - row_offset;
+
+        let pivot_diagonal = buffer_matrix[[i_pivot, i_row]];
+
+        if pivot_diagonal == 0.0 {
+            // look for next row with non-zero value and swap
+            let mut found = false;
+            for j_row in (i_pivot + 1)..number_of_rows {
+                found = buffer_matrix[[j_row, i_row]] != 0.0;
+                if found {
+                    let pivot_row_buffer = buffer_matrix.row(i_pivot).to_owned();
+                    let j_row_buffer = buffer_matrix.row(j_row).to_owned();
+
+                    buffer_matrix.row_mut(i_pivot).assign(&j_row_buffer);
+                    buffer_matrix.row_mut(j_row).assign(&pivot_row_buffer);
+
+                    let pivot_row_buffer = change_of_basis.row(i_pivot).to_owned();
+                    let j_row_buffer = change_of_basis.row(j_row).to_owned();
+
+                    change_of_basis.row_mut(i_pivot).assign(&j_row_buffer);
+                    change_of_basis.row_mut(j_row).assign(&pivot_row_buffer);
+
+                    break;
+                }
+            }
+
+            if !found {
+                row_offset += 1;
+                continue;
+            }
+        }
+
+        let pivot_diagonal = buffer_matrix[[i_pivot, i_row]];
+
+        for value in buffer_matrix.row_mut(i_pivot).iter_mut() {
+            *value /= pivot_diagonal;
+        }
+
+        for value in change_of_basis.row_mut(i_pivot).iter_mut() {
+            *value /= pivot_diagonal;
+        }
+
+        let pivot_vector = buffer_matrix.row(i_pivot).to_owned();
+        let basis_pivot_vector = change_of_basis.row(i_pivot).to_owned();
+
+        for j_row in 0..number_of_rows {
+            if j_row == i_pivot {
+                continue;
+            }
+
+            let multiplier = buffer_matrix[[j_row, i_row]];
+            for (value, pivot) in zip(buffer_matrix.row_mut(j_row).iter_mut(), pivot_vector.iter())
+            {
+                *value -= pivot * multiplier;
+            }
+
+            for (value, pivot) in zip(
+                change_of_basis.row_mut(j_row).iter_mut(),
+                basis_pivot_vector.iter(),
+            ) {
+                *value -= pivot * multiplier;
+            }
+        }
+    }
+
+    let first_non_zero = match buffer_matrix
+        .row(number_of_pivots - 1)
+        .iter()
+        .find(|&&val| val != 0.0)
+    {
+        Some(reference) => Some(reference.clone()),
+        None => None,
+    };
+
+    match first_non_zero {
+        Some(first_non_zero) => {
+            if first_non_zero != 1.0 {
+                for value in buffer_matrix.row_mut(number_of_pivots - 1).iter_mut() {
+                    *value = *value / first_non_zero;
+                }
+
+                for value in change_of_basis.row_mut(number_of_pivots - 1).iter_mut() {
+                    *value = *value / first_non_zero;
+                }
+            }
+        }
+        None => (),
+    };
+
+    (buffer_matrix, change_of_basis)
+}
+
+pub struct HomologyGroup {
+    pub cycle_basis: Array2<i32>,
+    pub boundary_basis: Array2<i32>,
+}
+
+impl HomologyGroup {
+    pub fn new(top_boundary_map: &Array2<i32>, bottom_boundary_map: &Array2<i32>) -> HomologyGroup {
+        HomologyGroup {
+            cycle_basis: Array2::zeros((0, 0)),
+            boundary_basis: Array2::zeros((0, 0)),
+        }
+    }
+
+    pub fn from_chain_complex(complex: &ChainComplex) -> Vec<HomologyGroup> {
+        Vec::new()
+    }
+
+    pub fn betti_number(&self) -> usize {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use ndarray::array;
+    use ndarray_rand::RandomExt;
+    use ndarray_rand::rand_distr::Uniform;
+    use rand::Rng;
 
     fn to_unordered(ordered: &Array2<usize>) -> HashSet<Simplex> {
         HashSet::from_iter(
@@ -347,5 +484,37 @@ mod tests {
             )),
             &complex.boundary_operators[2].dot(&complex.boundary_operators[1])
         );
+    }
+
+    #[test]
+    fn test_reduced_row_echelon_form_random() {
+        let mut rng = rand::rng();
+        let random_matrix = Array2::random(
+            (rng.random_range(1..50), rng.random_range(1..50)),
+            Uniform::new(0, 10),
+        );
+        let (rref, basis) = reduced_row_echelon_form(&random_matrix);
+        for i_row in 0..rref.shape()[0] {
+            let max_j_col = min(i_row, rref.shape()[1] - 1);
+            for j_col in 0..max_j_col {
+                assert_eq!(rref[[i_row, j_col]], 0.0);
+            }
+            let diagonal = rref[[i_row, max_j_col]];
+            assert!(diagonal == 1.0 || diagonal == 0.0);
+        }
+
+        let float_matrix = Array2::from_shape_vec(
+            [random_matrix.shape()[0], random_matrix.shape()[1]],
+            random_matrix
+                .iter()
+                .map(|val| *val as f64)
+                .collect::<Vec<f64>>(),
+        )
+        .unwrap();
+
+        let change = basis.dot(&float_matrix);
+        let _ = zip(rref.iter(), change.iter())
+            .map(|(lhs, rhs)| assert!((*lhs - *rhs).abs() < 1e-8))
+            .collect::<Vec<_>>();
     }
 }
