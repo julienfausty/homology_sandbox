@@ -1,7 +1,7 @@
 //! A module for computing homology groups on simplicial complexes
 
 use itertools::Itertools;
-use ndarray::{Array1, Array2, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView2, s};
 
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
@@ -226,6 +226,8 @@ impl ChainComplex {
     }
 }
 
+/// return the reduced row echelon form of the provided matrix along with the change of basis
+/// matrix that takes the original matrix to the reduced form
 fn reduced_row_echelon_form(matrix: &Array2<i32>) -> (Array2<f64>, Array2<f64>) {
     let mut buffer_matrix = Array2::from_shape_vec(
         [matrix.shape()[0], matrix.shape()[1]],
@@ -336,6 +338,7 @@ fn reduced_row_echelon_form(matrix: &Array2<i32>) -> (Array2<f64>, Array2<f64>) 
     (buffer_matrix, change_of_basis)
 }
 
+#[derive(Debug)]
 pub struct HomologyGroup {
     pub cycle_basis: Array2<i32>,
     pub boundary_basis: Array2<i32>,
@@ -343,18 +346,94 @@ pub struct HomologyGroup {
 
 impl HomologyGroup {
     pub fn new(top_boundary_map: &Array2<i32>, bottom_boundary_map: &Array2<i32>) -> HomologyGroup {
+        let (top_rref, top_basis_change) = reduced_row_echelon_form(top_boundary_map);
+
+        let first_zero_row = match top_rref
+            .rows()
+            .into_iter()
+            .map(|row| row.into_iter().map(|value| value.powf(2.0)).sum())
+            .position(|norm: f64| norm < 1e-12)
+        {
+            Some(i_row) => i_row,
+            None => top_rref.shape()[0],
+        };
+
+        let boundary_basis = Array2::from_shape_vec(
+            (first_zero_row, top_basis_change.shape()[1]),
+            top_basis_change
+                .slice(s![..first_zero_row, ..])
+                .into_iter()
+                .map(|value| *value as i32)
+                .collect(),
+        )
+        .unwrap();
+
+        let (bottom_rref, bottom_basis_change) =
+            reduced_row_echelon_form(&bottom_boundary_map.t().to_owned());
+        let bottom_rref = bottom_rref.t().to_owned();
+        let bottom_basis_change = bottom_basis_change.t().to_owned();
+
+        let first_zero_col = match bottom_rref
+            .columns()
+            .into_iter()
+            .map(|col| col.into_iter().map(|value| value.powf(2.0)).sum())
+            .position(|norm: f64| norm < 1e-12)
+        {
+            Some(i_col) => i_col,
+            None => bottom_rref.shape()[1],
+        };
+
+        let cycle_basis = Array2::from_shape_vec(
+            (
+                bottom_basis_change.shape()[0],
+                bottom_rref.shape()[1] - first_zero_col,
+            ),
+            bottom_basis_change
+                .slice(s![.., first_zero_col..])
+                .into_iter()
+                .map(|value| *value as i32)
+                .collect(),
+        )
+        .unwrap()
+        .t()
+        .to_owned();
+
         HomologyGroup {
-            cycle_basis: Array2::zeros((0, 0)),
-            boundary_basis: Array2::zeros((0, 0)),
+            cycle_basis,
+            boundary_basis,
         }
     }
 
     pub fn from_chain_complex(complex: &ChainComplex) -> Vec<HomologyGroup> {
-        Vec::new()
+        if complex.boundary_operators.is_empty() {
+            return Vec::new();
+        }
+
+        let number_boundary_operators = complex.boundary_operators.len();
+
+        let mut groups = vec![HomologyGroup::new(
+            &Array2::zeros((complex.chain_groups[0].shape()[0], 1)),
+            &complex.boundary_operators[0],
+        )];
+
+        groups.extend(
+            zip(
+                complex.boundary_operators[..(number_boundary_operators - 1)].iter(),
+                complex.boundary_operators[1..].iter(),
+            )
+            .map(|(top, bottom)| HomologyGroup::new(top, bottom)),
+        );
+
+        groups.push(HomologyGroup::new(
+            &complex.boundary_operators[number_boundary_operators - 1],
+            &Array2::zeros((1, complex.chain_groups.last().unwrap().shape()[0])),
+        ));
+
+        groups.into_iter().rev().collect()
     }
 
     pub fn betti_number(&self) -> usize {
-        0
+        self.cycle_basis.shape()[0] - self.boundary_basis.shape()[0]
     }
 }
 
@@ -516,5 +595,130 @@ mod tests {
         let _ = zip(rref.iter(), change.iter())
             .map(|(lhs, rhs)| assert!((*lhs - *rhs).abs() < 1e-8))
             .collect::<Vec<_>>();
+    }
+
+    #[test]
+    fn test_homology_group_curve() {
+        let curve = array![[0, 1], [1, 2], [2, 3], [3, 4]];
+
+        let complex = ChainComplex::new(SimplicialComplex::from(curve)).unwrap();
+
+        let homology_group = HomologyGroup::new(
+            &complex.boundary_operators[0],
+            &Array2::zeros((1, complex.chain_groups[1].shape()[0])),
+        );
+
+        assert!(homology_group.betti_number() == 1);
+    }
+
+    #[test]
+    fn test_homology_group_tetra() {
+        let tetra = array![[0, 1, 2, 3]];
+
+        let complex = ChainComplex::new(SimplicialComplex::from(tetra)).unwrap();
+
+        let homology_group = HomologyGroup::new(
+            &complex.boundary_operators[1],
+            &complex.boundary_operators[2],
+        );
+
+        assert!(homology_group.betti_number() == 0);
+    }
+
+    #[test]
+    fn test_homology_group_sphere() {
+        let tetra = array![[0, 1, 2, 3]];
+
+        let complex = ChainComplex::new(SimplicialComplex::from(tetra)).unwrap();
+
+        let homology_group = HomologyGroup::new(
+            &Array2::zeros((complex.chain_groups[1].shape()[0], 1)),
+            &complex.boundary_operators[1],
+        );
+
+        assert_eq!(homology_group.betti_number(), 1);
+    }
+
+    #[test]
+    fn test_homology_groups_circle() {
+        let curve = array![[0, 1], [1, 2], [2, 3], [3, 4], [4, 0]];
+
+        let complex = ChainComplex::new(SimplicialComplex::from(curve)).unwrap();
+
+        let homology_groups = HomologyGroup::from_chain_complex(&complex);
+
+        assert_eq!(homology_groups.len(), 2);
+
+        assert_eq!(homology_groups[0].betti_number(), 1);
+        assert_eq!(homology_groups[1].betti_number(), 1);
+    }
+
+    #[test]
+    fn test_homology_groups_tetra() {
+        let tetra = array![[0, 1, 2, 3]];
+
+        let complex = ChainComplex::new(SimplicialComplex::from(tetra)).unwrap();
+
+        let homology_groups = HomologyGroup::from_chain_complex(&complex);
+
+        assert_eq!(homology_groups.len(), 4);
+        assert_eq!(homology_groups[0].betti_number(), 1);
+        assert_eq!(homology_groups[1].betti_number(), 0);
+        assert_eq!(homology_groups[2].betti_number(), 0);
+        assert_eq!(homology_groups[3].betti_number(), 0);
+    }
+
+    #[test]
+    fn test_homology_groups_strip() {
+        let strip = array![
+            [0, 1, 2],
+            [2, 1, 3],
+            [2, 3, 4],
+            [4, 3, 0],
+            [0, 3, 5],
+            [5, 1, 0]
+        ];
+
+        let complex = ChainComplex::new(SimplicialComplex::from(strip)).unwrap();
+
+        let homology_groups = HomologyGroup::from_chain_complex(&complex);
+
+        assert_eq!(homology_groups.len(), 3);
+        assert_eq!(homology_groups[0].betti_number(), 1);
+        assert_eq!(homology_groups[1].betti_number(), 1);
+        assert_eq!(homology_groups[2].betti_number(), 0);
+    }
+
+    #[test]
+    fn test_homology_groups_torus() {
+        let torus = array![
+            [0, 7, 3],
+            [3, 8, 4],
+            [4, 2, 0],
+            [2, 0, 7],
+            [7, 3, 8],
+            [8, 4, 2],
+            [2, 5, 7],
+            [7, 6, 8],
+            [8, 1, 2],
+            [1, 2, 5],
+            [5, 7, 6],
+            [6, 8, 1],
+            [1, 3, 5],
+            [5, 4, 6],
+            [6, 0, 1],
+            [1, 0, 3],
+            [5, 3, 4],
+            [6, 4, 0]
+        ];
+
+        let complex = ChainComplex::new(SimplicialComplex::from(torus)).unwrap();
+
+        let homology_groups = HomologyGroup::from_chain_complex(&complex);
+
+        assert_eq!(homology_groups.len(), 3);
+        assert_eq!(homology_groups[0].betti_number(), 1);
+        assert_eq!(homology_groups[1].betti_number(), 2);
+        assert_eq!(homology_groups[2].betti_number(), 1);
     }
 }
